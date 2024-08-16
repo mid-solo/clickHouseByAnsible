@@ -1,0 +1,201 @@
+- name: Create GCP VMs based on provided counts
+  hosts: localhost
+  gather_facts: no
+  vars:
+    keeper_count: "{{ keeper_count | int }}"
+    node_count: "{{ node_count | int }}"
+    team: "{{ team }}"
+    cluster: "{{ cluster }}"
+    project: "intense-nexus-126408"
+    zone: "asia-south1-a"
+  tasks:
+    - name: Generate keeper VM names
+      set_fact:
+        vm_names_keepers: "{{ lookup('sequence', 'start=1 end=' ~ keeper_count | int | string, wantlist=True) | map('regex_replace', '^(.*)$', 'prod-' ~ team ~ '-' ~ cluster ~ '-keeper-\\1') | map('regex_replace', '^prod-' ~ team ~ '-' ~ cluster ~ '-keeper-(\\d)$', 'prod-' ~ team ~ '-' ~ cluster ~ '-keeper-0\\1') | list }}"
+
+    - name: Generate node VM names
+      set_fact:
+        vm_names_nodes: "{{ lookup('sequence', 'start=1 end=' ~ node_count | int | string, wantlist=True) | map('regex_replace', '^(.*)$', 'prod-' ~ team ~ '-' ~ cluster ~ '-node-\\1') | map('regex_replace', '^prod-' ~ team ~ '-' ~ cluster ~ '-node-(\\d)$', 'prod-' ~ team ~ '-' ~ cluster ~ '-node-0\\1') | list }}"
+
+    - name: Combine VM names
+      set_fact:
+        vm_names: "{{ vm_names_keepers + vm_names_nodes }}"
+
+    - name: Print VM names
+      debug:
+        msg: "VMs to be created: {{ vm_names }}"
+
+    - name: Create vms
+      gcp_compute_instance:
+        state: present 
+        name: "{{ item }}"
+        machine_type: "n2d-custom-8-8192" 
+        disks:
+        - auto_delete: true
+          boot: true
+          initialize_params:
+            source_image: "projects/intense-nexus-126408/global/images/prod-ch-template-boot-disk-image-v0"
+        - auto_delete: true
+          boot: false
+          initialize_params:
+            source_image: "projects/intense-nexus-126408/global/images/prod-ch-template-add-disk-image-v0"
+          device_name: clickhouse-data
+        network_interfaces:
+        - network: 
+            selfLink: "https://www.googleapis.com/compute/v1/projects/intense-nexus-126408/global/networks/vpc-core-services"
+          subnetwork: 
+            selfLink: "https://www.googleapis.com/compute/v1/projects/intense-nexus-126408/regions/asia-south1/subnetworks/subnet-cassandra"
+        zone: "{{ zone }}"
+        project: "{{ project }}"
+        auth_kind: "application"
+        tags:
+         items:
+         - click-house
+        service_accounts:
+        - email: 19523251995-compute@developer.gserviceaccount.com 
+          scopes: https://www.googleapis.com/auth/cloud-platform
+      loop: "{{ vm_names }}"
+    - name: Get VM facts
+      google.cloud.gcp_compute_instance_info:
+        project: "{{ project }}"
+        zone: "{{ zone }}"
+        auth_kind: "application"
+      register: gce_facts
+
+#this pause task is introduced to make ansible not ssh into VMs while they are still booting UP.
+    - name: Pause for 30 seconds
+      pause:
+        seconds: 30
+
+    - name: Extract internal IPs
+      set_fact:
+        internal_ips: >-
+          {{
+            gce_facts.resources | selectattr('name', 'in', vm_names) | map(attribute='networkInterfaces') | flatten | map(attribute='networkIP') | list
+          }}
+
+    - name: Extract internal IPs for keepers
+      set_fact:
+        internal_ips_keepers: >-
+          {{
+            gce_facts.resources | selectattr('name', 'in', vm_names_keepers) | map(attribute='networkInterfaces') | flatten | map(attribute='networkIP') | list
+          }}
+
+    - name: Extract internal IPs for nodes
+      set_fact:
+        internal_ips_nodes: >-
+          {{
+            gce_facts.resources | selectattr('name', 'in', vm_names_nodes) | map(attribute='networkInterfaces') | flatten | map(attribute='networkIP') | list
+          }}
+
+    - name: Calculate weight
+      set_fact:
+        weight: "{{ (1 / internal_ips_nodes|length) | round(2) }}"          
+
+    - name: Print internal IPs
+      debug:
+        msg: "Internal IPs: {{ internal_ips }}"        
+    - name: Print internal IPs of keepers
+      debug:
+        msg: "Internal IPs of keepers: {{ internal_ips_keepers }}"
+    - name: Print internal IPs of nodes
+      debug:
+        msg: "Internal IPs of nodes: {{ internal_ips_nodes }}"
+          
+    - name: Generate keeper_config.xml for each keeper
+      template:
+        src: /data/dist/playbooks/click-house/keeper_config_template.xml.j2
+        dest: "/tmp/keeper_config_{{ item.0 }}.xml"
+      loop: "{{ internal_ips_keepers | zip(range(1, internal_ips_keepers|length + 1)) | list }}"
+      vars:
+        server_id: "{{ item.1 }}"
+        current_ip: "{{ item.0 }}"
+
+    - name: Copy keeper_config.xml to each keeper
+      ansible.builtin.copy:
+        src: "/tmp/keeper_config_{{ item }}.xml"
+        dest: /etc/clickhouse-keeper/keeper_config.xml
+        mode: '0644'
+      loop: "{{ internal_ips_keepers }}"
+      delegate_to: "{{ item }}"
+      become: yes
+
+    - name: Enable clickhouse-keeper service
+      systemd:
+        name: clickhouse-keeper
+        enabled: yes
+      become: yes
+      loop: "{{ internal_ips_keepers }}"
+      delegate_to: "{{ item }}"
+
+    - name: Start clickhouse-keeper service
+      systemd:
+        name: clickhouse-keeper
+        state: started
+      become: yes
+      loop: "{{ internal_ips_keepers }}"
+      delegate_to: "{{ item }}"
+
+    - name: Clean up temporary config files of keepers
+      file:
+        path: "/tmp/keeper_config_{{ item }}.xml"
+        state: absent
+      loop: "{{ internal_ips }}"
+
+    - name: Generate node_config.xml for each node
+      template:
+        src: /data/dist/playbooks/click-house/node_config_template.xml.j2
+        dest: "/tmp/node_config_{{ item.0 }}.xml"
+      loop: "{{ internal_ips_nodes | zip(range(1, internal_ips_nodes|length + 1)) | list }}"
+      vars:
+        server_id: "{{ item.1 }}"
+        current_ip: "{{ item.0 }}"
+
+    - name: Copy node_config.xml to each node
+      ansible.builtin.copy:
+        src: "/tmp/node_config_{{ item }}.xml"
+        dest: /etc/clickhouse-server/config.xml
+        mode: '0644'
+      loop: "{{ internal_ips_nodes }}"
+      delegate_to: "{{ item }}"
+      become: yes
+
+    - name: Copy user_node_config.xml to each node
+      ansible.builtin.template:
+        src: "/data/dist/playbooks/click-house/node_user_config.xml.j2"
+        dest: /etc/clickhouse-server/users.xml
+        mode: '0644'
+      loop: "{{ internal_ips_nodes }}"
+      delegate_to: "{{ item }}"
+      become: yes
+        
+    - name: Enable clickhouse-node service
+      systemd:
+        name: clickhouse-server
+        enabled: yes
+      become: yes
+      loop: "{{ internal_ips_nodes }}"
+      delegate_to: "{{ item }}"
+
+    - name: Restart clickhouse-node service
+      systemd:
+        name: clickhouse-server
+        state: restarted
+      become: yes
+      loop: "{{ internal_ips_nodes }}"
+      delegate_to: "{{ item }}"
+        
+    - name: Delete default-password.xml file
+      file:
+        path: /etc/clickhouse-server/users.d/default-password.xml
+        state: absent
+      become: yes
+      loop: "{{ internal_ips_nodes }}"
+      delegate_to: "{{ item }}"
+
+
+    - name: Clean up temporary config files for nodes
+      file:
+        path: "/tmp/node_config_{{ item }}.xml"
+        state: absent
+      loop: "{{ internal_ips_nodes }}"
