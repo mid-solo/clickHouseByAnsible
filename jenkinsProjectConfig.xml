@@ -1,0 +1,117 @@
+<?xml version='1.1' encoding='UTF-8'?>
+<project>
+  <actions/>
+  <description>this job is created to create clickhouse cluster with keepers and nodes with dynamically configuring config.xml files.</description>
+  <keepDependencies>false</keepDependencies>
+  <properties>
+    <com.sonyericsson.rebuild.RebuildSettings plugin="rebuild@330.v645b_7df10e2a_">
+      <autoRebuild>false</autoRebuild>
+      <rebuildDisabled>false</rebuildDisabled>
+    </com.sonyericsson.rebuild.RebuildSettings>
+    <hudson.model.ParametersDefinitionProperty>
+      <parameterDefinitions>
+        <hudson.model.ChoiceParameterDefinition>
+          <name>team</name>
+          <description>For which team this cluster is created for:</description>
+          <choices class="java.util.Arrays$ArrayList">
+            <a class="string-array">
+              <string>platform</string>
+              <string>team1</string>
+              <string>team2</string>
+              <string>team3</string>
+            </a>
+          </choices>
+        </hudson.model.ChoiceParameterDefinition>
+        <hudson.model.StringParameterDefinition>
+          <name>cluster</name>
+          <description>Provide a meaningful name for cluster.</description>
+          <defaultValue>clickhouse</defaultValue>
+          <trim>false</trim>
+        </hudson.model.StringParameterDefinition>
+        <hudson.model.StringParameterDefinition>
+          <name>keeper_count</name>
+          <description>How many keepers you want in this cluster:</description>
+          <defaultValue>1</defaultValue>
+          <trim>false</trim>
+        </hudson.model.StringParameterDefinition>
+        <hudson.model.StringParameterDefinition>
+          <name>node_count</name>
+          <description>How many nodes you want in this cluster:</description>
+          <defaultValue>1</defaultValue>
+          <trim>false</trim>
+        </hudson.model.StringParameterDefinition>
+      </parameterDefinitions>
+    </hudson.model.ParametersDefinitionProperty>
+    <hudson.plugins.throttleconcurrents.ThrottleJobProperty plugin="throttle-concurrents@2.14">
+      <maxConcurrentPerNode>0</maxConcurrentPerNode>
+      <maxConcurrentTotal>0</maxConcurrentTotal>
+      <categories class="java.util.concurrent.CopyOnWriteArrayList"/>
+      <throttleEnabled>false</throttleEnabled>
+      <throttleOption>project</throttleOption>
+      <limitOneJobWithMatchingParams>false</limitOneJobWithMatchingParams>
+      <paramsToUseForLimit></paramsToUseForLimit>
+    </hudson.plugins.throttleconcurrents.ThrottleJobProperty>
+  </properties>
+  <scm class="hudson.scm.NullSCM"/>
+  <canRoam>true</canRoam>
+  <disabled>false</disabled>
+  <blockBuildWhenDownstreamBuilding>false</blockBuildWhenDownstreamBuilding>
+  <blockBuildWhenUpstreamBuilding>false</blockBuildWhenUpstreamBuilding>
+  <triggers/>
+  <concurrentBuild>false</concurrentBuild>
+  <builders>
+    <hudson.tasks.Shell>
+      <command>#!/bin/bash -e
+
+echo &quot;Keeper count:$keeper_count&quot;
+echo &quot;Node count: $node_count&quot;
+echo &quot;Team name: $team&quot;
+echo &quot;Cluster name: $cluster&quot;
+
+if [ &quot;$node_count&quot; -gt 0 ] &amp;&amp; [ &quot;$node_count&quot; -le 10 ] &amp;&amp; [ &quot;$keeper_count&quot; -gt 0 ] &amp;&amp; [ &quot;$keeper_count&quot; -le 10 ]; then
+    echo &quot;node and keeper count are within limits. Proceed&quot;
+else
+    echo &quot;node_count and keeper_count should be between 1 and 10.&quot;
+    exit 1
+fi
+
+# File to store used parameter pairs
+USED_PAIRS_FILE=&quot;/data/ext/used_pairs.txt&quot;
+
+# Read input parameters
+VAR1=&quot;${team}&quot;
+VAR2=&quot;${cluster}&quot;
+
+# Check if the pairs file exists, if not create it
+if [ ! -f &quot;$USED_PAIRS_FILE&quot; ]; then
+    touch &quot;$USED_PAIRS_FILE&quot;
+fi
+
+# Check if the var2 value has already been used with a different var1
+if grep -q &quot;^.*,${VAR2}$&quot; &quot;$USED_PAIRS_FILE&quot; &amp;&amp; ! grep -q &quot;^${VAR1},${VAR2}$&quot; &quot;$USED_PAIRS_FILE&quot;; then
+    echo &quot;Value ${VAR2} has already been used with a different var1.&quot;
+    exit 1
+fi
+
+# Store the new pair if not already present
+if ! grep -q &quot;^${VAR1},${VAR2}$&quot; &quot;$USED_PAIRS_FILE&quot;; then
+    echo &quot;${VAR1},${VAR2}&quot; &gt;&gt; &quot;$USED_PAIRS_FILE&quot;
+    echo &quot;Pair (${VAR1}, ${VAR2}) stored successfully.&quot;
+else
+    echo &quot;Pair (${VAR1}, ${VAR2}) already exists.&quot;
+fi
+
+
+clickhouse_password=$(gcloud secrets versions access latest --secret=CLICKHOUSE_PASSWORD)
+access_key=$(gcloud secrets versions access latest --secret=PROD_CH_ACCESS_ID)
+secret_key=$(gcloud secrets versions access latest --secret=PROD_CH_SECRET_KEY)
+
+ansible-playbook  /data/dist/playbooks/click-house/playbook.yaml --extra-vars &quot;keeper_count=${keeper_count} node_count=${node_count} team=${team} cluster=${cluster} access_key=${access_key} secret_key=${secret_key} clickhouse_password=${clickhouse_password}&quot;
+
+</command>
+      <configuredLocalRules/>
+    </hudson.tasks.Shell>
+  </builders>
+  <publishers/>
+  <buildWrappers/>
+</project>
